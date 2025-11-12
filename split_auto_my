@@ -1,0 +1,145 @@
+-- DROP PROCEDURE public.split_auto_live_my(int4, int4);
+
+CREATE OR REPLACE PROCEDURE public.split_auto_live_my(IN _pid integer, IN _webcode integer)
+ LANGUAGE plpgsql
+AS $procedure$
+DECLARE
+    _sid integer;
+    _eid integer;
+    _tc integer;
+    _split1 integer := 1;
+    _avgcount integer;
+    _lookid integer := 1;
+    _machine varchar(70);
+    _input varchar(1000);
+    _db varchar(400);
+    _status varchar(5);
+    _split integer;
+    _cocount integer;
+    _mcount integer;
+    min_id integer;
+    max_id integer;
+    mac_split varchar(100);
+BEGIN
+    RAISE NOTICE '-----------------';
+    RAISE NOTICE 'Procedure Started';
+
+    -- Count inputs and machines
+    SELECT COUNT(*) INTO _cocount FROM input_my WHERE source_id = _webcode AND status = 0;
+    SELECT COUNT(*) INTO _mcount FROM machines_my WHERE source_id = _webcode;
+    SELECT machineip INTO mac_split FROM machines_my WHERE source_id = _webcode ORDER BY random() LIMIT 1;
+
+    IF _cocount > _mcount THEN
+        RAISE NOTICE 'Entering normal split';
+		RAISE NOTICE 'Input Table: input_my';
+        RAISE NOTICE 'source_id: %', _webcode;
+
+        -- Prepare temp tables
+        CREATE TEMP TABLE IF NOT EXISTS sp_input(c_input varchar(50)) ON COMMIT DROP;
+        CREATE TEMP TABLE IF NOT EXISTS sp_status(c_status integer) ON COMMIT DROP;
+        CREATE TEMP TABLE IF NOT EXISTS sp_runids(id serial, c_id integer) ON COMMIT DROP;
+        CREATE TEMP TABLE IF NOT EXISTS sp_machines(id serial, machineip varchar(50)) ON COMMIT DROP;
+
+        TRUNCATE TABLE sp_input RESTART IDENTITY;
+        INSERT INTO sp_input(c_input)
+        SELECT input FROM pyscripts WHERE source_id = _webcode AND processid = _pid LIMIT 1;
+
+        SELECT c_input INTO _input FROM sp_input;
+		RAISE NOTICE 'input: %', _input;
+        TRUNCATE TABLE sp_status RESTART IDENTITY;
+        INSERT INTO sp_status(c_status)
+        SELECT status FROM pyscripts WHERE source_id = _webcode AND processid = _pid LIMIT 1;
+
+        SELECT c_status INTO _status FROM sp_status;
+
+        TRUNCATE TABLE sp_runids RESTART IDENTITY;
+
+        EXECUTE format('INSERT INTO sp_runids(c_id) SELECT id FROM %I WHERE source_id = %L AND status = 0 ORDER BY id',
+                       _input, _webcode::text);
+
+        SELECT COUNT(*) INTO _split FROM machines_my WHERE source_id = _webcode;
+
+        TRUNCATE TABLE sp_machines RESTART IDENTITY;
+        INSERT INTO sp_machines(machineip)
+        SELECT machineip FROM machines_my WHERE source_id = _webcode LIMIT _split;
+
+        SELECT COUNT(*) INTO _tc FROM sp_runids;
+        SELECT _tc / _split INTO _avgcount;
+
+        -- Remove duplicates before split
+        DELETE FROM pyscripts
+        WHERE id IN (
+            SELECT id FROM (
+                SELECT id, ROW_NUMBER() OVER (PARTITION BY processid, source_id ORDER BY id) AS rnum
+                FROM pyscripts WHERE processid = _pid AND source_id = _webcode
+            ) t WHERE t.rnum > 1
+        );
+
+        WHILE _split1 <= _split LOOP
+            SELECT c_id INTO _sid FROM sp_runids WHERE id = _lookid;
+            SELECT c_id INTO _eid FROM sp_runids WHERE id = LEAST(_lookid + _avgcount - 1, _tc);
+            SELECT machineip INTO _machine FROM sp_machines WHERE id = _split1;
+
+            IF _split1 = 1 THEN
+                UPDATE pyscripts
+                SET startid = _sid, endid = _eid, machineip = _machine, totalcount = _avgcount
+                WHERE processid = _pid AND source_id = _webcode;
+            ELSE
+                INSERT INTO pyscripts(
+                    source_id, script, threadcount, machines, createddate, dtmodified, developerid,
+                    changecount, runstatus, processid, startid, endid, modifierid, modifiedfor, lastrun,
+                    machineip, input, output, db, status, proxyid, "Server", s3offline, msdb, crawltype,
+                    endcount, offline, python3, totalcount, serverid, domainname, error_description,
+                    cookiestart, cookieend, apitokenid
+                )
+                SELECT
+                    source_id, script, threadcount, machines, createddate, dtmodified, developerid,
+                    changecount, runstatus, processid, _sid, _eid, modifierid, modifiedfor, lastrun,
+                    _machine, input, output, db, status, proxyid, "Server", s3offline, msdb, crawltype,
+                    endcount, offline, python3, _avgcount, serverid, domainname, error_description,
+                    cookiestart, cookieend, apitokenid
+                FROM pyscripts
+                WHERE processid = _pid AND source_id = _webcode
+                LIMIT 1;
+            END IF;
+
+            _lookid := _lookid + _avgcount;
+            _split1 := _split1 + 1;
+        END LOOP;
+
+        -- Clean up potential duplicates after split
+        DELETE FROM pyscripts
+        WHERE id IN (
+            SELECT id FROM (
+                SELECT id, ROW_NUMBER() OVER (PARTITION BY processid, source_id, machineip ORDER BY id) AS rnum
+                FROM pyscripts WHERE processid = _pid AND source_id = _webcode
+            ) t WHERE t.rnum > 1
+        );
+
+    ELSE
+        RAISE NOTICE 'Entering one-machine split condition';
+		RAISE NOTICE 'Input Table: input_my';
+        RAISE NOTICE 'source_id: %', _webcode;
+
+        EXECUTE format(
+            'SELECT MIN(id), MAX(id) FROM %I WHERE source_id = %L AND status = 0',
+            'input_my', _webcode::text
+        )
+        INTO min_id, max_id;
+        RAISE NOTICE 'Min ID: %, Max ID: %', min_id, max_id;
+
+        UPDATE pyscripts
+        SET startid = min_id, endid = max_id
+        WHERE machineip = mac_split AND source_id = _webcode AND processid = _pid;
+
+        RAISE NOTICE 'Machine IP: %', mac_split;
+
+        RAISE NOTICE 'Updated pyscripts for source_id: %, process ID: %, machine IP: %',
+                     _webcode, _pid, mac_split;
+    END IF;
+
+    RAISE NOTICE 'Procedure completed';
+    RAISE NOTICE '-----------------';
+END;
+$procedure$
+;
